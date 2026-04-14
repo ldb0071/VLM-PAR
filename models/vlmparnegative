@@ -1,0 +1,606 @@
+import os
+import json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
+from vlmpar.registery import MODELS
+from vlmpar.models.vlmpar import VLMPAR
+from vlmpar.models.focal_loss import FocalLoss
+
+class NegativePromptGenerator:
+    """Generates negative prompts based on positive prompts using a lightweight LLM"""
+    
+    def __init__(self, model_name="databricks/dolly-v2-3b", device=None):
+        """
+        Initialize the negative prompt generator
+        Args:
+            model_name: Hugging Face model name for the LLM
+            device: Device to run inference on (defaults to CUDA if available)
+        """
+        self.device = device if device is not None else "cuda" if torch.cuda.is_available() else "cpu"
+        self.model_name = model_name
+        self.cache_path = "negative_prompt_cache.json"
+        self.cache = self._load_cache()
+        
+        # Initialize tokenizer immediately but defer model loading until needed
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = None
+    
+    def _load_model(self):
+        """Lazy-load the model when needed"""
+        if self.model is None:
+            print(f"Loading negative prompt generator model: {self.model_name}")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                torch_dtype=torch.float16,
+                device_map="auto"
+            )
+            
+    def _load_cache(self):
+        """Load the cache of previously generated prompts"""
+        if os.path.exists(self.cache_path):
+            try:
+                with open(self.cache_path, "r") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                print(f"Warning: Could not load cache from {self.cache_path}, creating new cache")
+        return {}
+    
+    def _save_cache(self):
+        """Save the cache to disk"""
+        try:
+            with open(self.cache_path, "w") as f:
+                json.dump(self.cache, f)
+        except IOError:
+            print(f"Warning: Could not save cache to {self.cache_path}")
+    
+    def generate_negative_prompt(self, positive_prompt, attribute_name=None):
+        """
+        Generate a concise negative prompt based on a positive one
+        Args:
+            positive_prompt: The positive prompt or question
+            attribute_name: Optional attribute name for better context
+        Returns:
+            A string containing the negative prompt
+        """
+        # Create a cache key including attribute context
+        cache_key = f"{positive_prompt}_{attribute_name}" if attribute_name else positive_prompt
+        
+        # Check cache first
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        # Load model if not already loaded
+        self._load_model()
+        
+        # Prepare context information
+        attribute_context = f" for the attribute '{attribute_name}'" if attribute_name else ""
+        
+        # Create a more direct, concise prompt for the LLM
+        instruction = (
+            f"Create an extremely concise negative prompt{attribute_context}. "
+            f"Focus only on the key visual element that should be absent. "
+            f"Maximum 8 words. Be direct and specific.\n\n"
+            f"Positive prompt: '{positive_prompt}'\n"
+            f"Negative prompt (8 words max):"
+        )
+        
+        # Tokenize input
+        inputs = self.tokenizer(instruction, return_tensors="pt").to(self.model.device)
+        
+        # Generate response with more temperature for creativity
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs["input_ids"],
+                max_new_tokens=15,  # Further reduced to enforce brevity
+                temperature=0.6,    # Reduced for more consistent outputs
+                do_sample=True,
+                top_p=0.85,
+            )
+        
+        # Decode output and extract the negative prompt
+        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        negative_prompt = generated_text.split("Negative prompt (8 words max):")[-1].strip()
+        
+        # Additional processing to ensure brevity
+        # Split by common sentence delimiters and take only the first part
+        for delimiter in ['.', ',', ';']:
+            parts = negative_prompt.split(delimiter, 1)
+            if len(parts) > 1 and len(parts[0].strip()) >= 3:  # Ensure we don't get too short
+                negative_prompt = parts[0].strip()
+                break
+                
+        # Ensure no prompt is longer than 8 words
+        words = negative_prompt.split()
+        if len(words) > 8:
+            negative_prompt = ' '.join(words[:8])
+        
+        # Remove any common filler words to make it more precise
+        filler_words = ['the', 'a', 'an', 'is', 'are', 'with', 'that', 'this', 'these', 'those']
+        if len(words) > 3:  # Only remove fillers if we have enough words
+            negative_prompt = ' '.join([w for w in negative_prompt.split() if w.lower() not in filler_words])
+            
+            # If removing fillers made it too short, revert to original cut
+            if len(negative_prompt.split()) < 2:
+                negative_prompt = ' '.join(words[:8])
+        
+        # Update cache
+        self.cache[cache_key] = negative_prompt
+        self._save_cache()
+        
+        return negative_prompt
+
+class EnhancedCrossAttention(nn.Module):
+    """Cross-attention mechanism that incorporates negative attention"""
+    
+    def __init__(self, hidden_size, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        
+        # Multi-head attention for positive and negative cross-attention
+        self.mha = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Learnable weight for negative attention subtraction
+        self.neg_attention_weight = nn.Parameter(torch.tensor(0.5))
+        
+        # Feature projection layers
+        self.image_proj = nn.Linear(hidden_size, hidden_size)
+        self.text_proj = nn.Linear(hidden_size, hidden_size)
+    
+    def forward(self, image_features, positive_text, negative_text=None):
+        """
+        Apply enhanced cross-attention with negative prompts
+        Args:
+            image_features: Image features [batch, seq_len, hidden]
+            positive_text: Positive text features [batch, seq_len, hidden]
+            negative_text: Optional negative text features [batch, seq_len, hidden]
+        Returns:
+            Enhanced feature representation
+        """
+        # Project features
+        image_proj = self.image_proj(image_features)
+        pos_text_proj = self.text_proj(positive_text)
+        
+        # Positive attention
+        attended_features, _ = self.mha(
+            query=image_proj,
+            key=pos_text_proj,
+            value=pos_text_proj
+        )
+        
+        # Apply negative attention if provided
+        if negative_text is not None:
+            neg_text_proj = self.text_proj(negative_text)
+            
+            # Ensure batch size matches
+            if neg_text_proj.shape[0] == 1 and image_proj.shape[0] > 1:
+                neg_text_proj = neg_text_proj.expand(image_proj.shape[0], -1, -1)
+            
+            # Negative attention
+            neg_attended_features, _ = self.mha(
+                query=image_proj,
+                key=neg_text_proj,
+                value=neg_text_proj
+            )
+            
+            # Apply subtraction with learnable weight
+            attended_features = attended_features - self.neg_attention_weight * neg_attended_features
+        
+        return attended_features
+
+class ContrastiveLoss(nn.Module):
+    """Contrastive loss for aligning positive samples and pushing away negative samples"""
+    
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+    
+    def forward(self, image_features, positive_features, negative_features=None):
+        """
+        Compute contrastive loss with positive and optional negative samples
+        Args:
+            image_features: Normalized image features [batch, hidden]
+            positive_features: Normalized positive text features [batch, hidden]
+            negative_features: Normalized negative text features [batch, hidden]
+        Returns:
+            Contrastive loss value
+        """
+        # Basic InfoNCE loss with positive samples
+        logits_pos = torch.sum(image_features * positive_features, dim=-1) / self.temperature
+        
+        if negative_features is not None:
+            # Calculate negative similarity
+            logits_neg = torch.sum(image_features * negative_features, dim=-1) / self.temperature
+            
+            # Combine into contrastive logits [batch, 2]
+            logits = torch.stack([logits_pos, logits_neg], dim=1)
+            
+            # Labels are all 0 (index of positive samples)
+            labels = torch.zeros(image_features.shape[0], dtype=torch.long, device=image_features.device)
+            
+            # Cross entropy loss
+            return F.cross_entropy(logits, labels)
+        else:
+            # Simple positive-only loss if no negatives provided
+            return -torch.mean(logits_pos)
+
+@MODELS.register('vlmpar_neg')
+class VLMPARNegative(VLMPAR):
+    """VLMPAR model with negative prompts and contrastive learning"""
+    
+    def __init__(self, model_name, num_classes_dict, questions=None, 
+                 negative_llm_model="databricks/dolly-v2-3b",
+                 use_cross_attention=True,
+                 contrastive_weight=0.5,
+                 temperature=0.07,
+                 focal_loss_alpha=0.25,
+                 focal_loss_gamma=2.0,
+                 use_focal_loss=False):
+        # Initialize the base VLMPAR model
+        super().__init__(model_name, num_classes_dict, questions)
+        
+        # Store configuration
+        self.use_cross_attention = use_cross_attention
+        self.contrastive_weight = contrastive_weight
+        self.use_focal_loss = use_focal_loss
+        
+        # Initialize the negative prompt generator
+        self.negative_prompt_generator = NegativePromptGenerator(model_name=negative_llm_model)
+        
+        # Initialize negative prompts cache
+        self.negative_prompts = {}
+        self.negative_embeddings = {}
+        
+        # Initialize cross-attention if enabled
+        if use_cross_attention:
+            self.cross_attention = EnhancedCrossAttention(self.hidden_size)
+            
+            # Feature projection layers
+            self.vision_proj = nn.Linear(self.hidden_size, self.hidden_size)
+            self.text_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        
+        # Initialize contrastive loss
+        self.contrastive_loss_fn = ContrastiveLoss(temperature=temperature)
+        
+        # Initialize focal loss if enabled
+        if use_focal_loss:
+            self.focal_loss = FocalLoss(alpha=focal_loss_alpha, gamma=focal_loss_gamma)
+    
+    def generate_all_negative_prompts(self):
+        """Generate negative prompts for all attributes"""
+        print("Generating negative prompts for all attributes...")
+        self.negative_prompts = {}
+        
+        for key, question in self.questions.items():
+            self.negative_prompts[key] = self.negative_prompt_generator.generate_negative_prompt(
+                question, attribute_name=key
+            )
+            print(f"Attribute: {key}")
+            print(f"  Positive: {question}")
+            print(f"  Negative: {self.negative_prompts[key]}")
+        
+        # Print a summary of the generated prompts
+        self.print_negative_prompt_examples(num_examples=10)
+        
+        return self.negative_prompts
+    
+    def _get_negative_embeddings(self, key, device):
+        """Get or compute negative embeddings for a given attribute"""
+        if key not in self.negative_embeddings:
+            # Generate negative prompt if not already done
+            if key not in self.negative_prompts:
+                self.negative_prompts[key] = self.negative_prompt_generator.generate_negative_prompt(
+                    self.questions[key], attribute_name=key
+                )
+            
+            # Tokenize and encode the negative prompt
+            neg_text_inputs = self.tokenizer(
+                self.negative_prompts[key], 
+                return_tensors="pt", 
+                padding=True
+            )
+            neg_text_inputs = {k: v.to(device) for k, v in neg_text_inputs.items()}
+            
+            # Get text embeddings
+            with torch.no_grad():
+                neg_text_outputs = self.vlm_base.text_model(**neg_text_inputs)
+            
+            # Store the embeddings
+            self.negative_embeddings[key] = neg_text_outputs.last_hidden_state
+            
+        return self.negative_embeddings[key].to(device)
+    
+    def forward(self, pixel_values, question_type=None, return_dict=True):
+        """
+        Forward pass
+        Args:
+            pixel_values: Input images
+            question_type: Type of question to process ('all' or specific type)
+            return_dict: Whether to return a dictionary (True) or just answers (False)
+        Returns:
+            Dictionary with answers, similarities, etc. for each question type
+        """
+        device = pixel_values.device
+        batch_size = pixel_values.shape[0]
+        
+        # Process images
+        image_outputs = self.vlm_base.vision_model(pixel_values)
+        image_seq = image_outputs.last_hidden_state
+        image_pooled = image_outputs.pooler_output
+        
+        # Project image features if using cross-attention
+        if self.use_cross_attention:
+            image_seq_proj = self.vision_proj(image_seq)
+        else:
+            image_seq_proj = None
+            
+        # Process all questions or just the specified one
+        if question_type == 'all':
+            return self._forward_all_attributes(
+                image_seq, image_pooled, image_seq_proj, device, return_dict
+            )
+        else:
+            return self._forward_single_attribute(
+                image_seq, image_pooled, image_seq_proj, 
+                question_type, device, return_dict
+            )
+    
+    def _forward_all_attributes(self, image_seq, image_pooled, image_seq_proj, device, return_dict):
+        """Process all attributes with negative prompts"""
+        answers = {}
+        losses = {}
+        total_contrastive_loss = 0
+        
+        # Process each attribute/question
+        for key in self.questions.keys():
+            # Process positive text
+            question = self.questions[key]
+            text_inputs = self.tokenizer(question, return_tensors="pt", padding=True)
+            text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+            
+            text_outputs = self.vlm_base.text_model(**text_inputs)
+            text_seq = text_outputs.last_hidden_state
+            text_pooled = text_outputs.pooler_output
+            
+            # Initialize features based on architecture
+            if self.use_cross_attention:
+                # Project text
+                text_seq_proj = self.text_proj(text_seq)
+                
+                # Handle batch size expansion
+                if text_seq_proj.shape[0] == 1 and image_seq_proj.shape[0] > 1:
+                    text_seq_proj = text_seq_proj.expand(image_seq_proj.shape[0], -1, -1)
+                
+                # Get negative embeddings
+                negative_text = self._get_negative_embeddings(key, device)
+                
+                # Expand negative text if needed
+                if negative_text.shape[0] == 1 and image_seq_proj.shape[0] > 1:
+                    negative_text = negative_text.expand(image_seq_proj.shape[0], -1, -1)
+                
+                # Apply cross-attention
+                attended_features = self.cross_attention(
+                    image_seq_proj, 
+                    text_seq_proj,
+                    negative_text
+                )
+                
+                # Use first token as representation
+                features = attended_features[:, 0, :]
+            else:
+                # Simple pooled features without cross-attention
+                features = image_pooled
+            
+            # Calculate cosine similarity
+            similarity = torch.cosine_similarity(features, text_pooled, dim=-1)
+            
+            # Make predictions
+            logits = self.classifier_heads[key](features)
+            probs = torch.softmax(logits, dim=-1)
+            preds = torch.argmax(probs, dim=-1)
+            
+            # Calculate contrastive loss if in training
+            if self.training and self.use_cross_attention:
+                neg_text_pooled = negative_text[:, 0, :]
+                
+                # Normalize features
+                norm_features = F.normalize(features, p=2, dim=-1)
+                norm_pos_text = F.normalize(text_seq_proj[:, 0, :], p=2, dim=-1)
+                norm_neg_text = F.normalize(neg_text_pooled, p=2, dim=-1)
+                
+                # Compute contrastive loss
+                contr_loss = self.contrastive_loss_fn(
+                    norm_features, 
+                    norm_pos_text,
+                    norm_neg_text
+                )
+                
+                total_contrastive_loss += contr_loss
+            
+            # Format answers and always include logits for the trainer
+            answers[key] = {
+                "logits": logits,
+                "probs": probs,
+                "similarity": similarity.tolist(),
+                "confidence": torch.max(probs, dim=-1)[0].tolist()
+            }
+            
+            # Add formatted text answers if needed
+            if return_dict:
+                if key in ['upper_body_color', 'lower_body_color']:
+                    answers[key]["answer"] = [f"The {key.replace('_', ' ')} is {self._get_color_name(p.item())}." for p in preds]
+                elif key == 'gender':
+                    answers[key]["answer"] = [f"The person is {'male' if p.item() == 1 else 'female'}." for p in preds]
+                elif key in ['bag', 'hat']:
+                    answers[key]["answer"] = [f"{'Yes' if p.item() == 1 else 'No'}, the person {'is' if p.item() == 1 else 'is not'} {'carrying a bag' if key == 'bag' else 'wearing a hat'}." for p in preds]
+                else:
+                    # Generic binary attribute handling
+                    if self.num_classes_dict[key] == 2:
+                        answers[key]["answer"] = [f"{'Yes' if p.item() == 1 else 'No'}, the person {'is' if p.item() == 1 else 'is not'} {key.replace('_', ' ')}." for p in preds]
+                    # Other attribute types
+                    else:
+                        answers[key]["answer"] = [f"The person's {key.replace('_', ' ')} is class {p.item()}." for p in preds]
+        
+        # Add losses for training
+        if self.training and total_contrastive_loss > 0:
+            losses["contrastive_loss"] = total_contrastive_loss
+            answers["losses"] = losses
+        
+        return answers if return_dict else " ".join([v["answer"][0] for v in answers.values()])
+    
+    def _forward_single_attribute(self, image_seq, image_pooled, image_seq_proj, 
+                                 question_type, device, return_dict):
+        """Process a single attribute with negative prompts"""
+        if question_type not in self.questions:
+            raise ValueError(f"Invalid question type. Must be one of {list(self.questions.keys())}")
+        
+        # Process positive text
+        question = self.questions[question_type]
+        text_inputs = self.tokenizer(question, return_tensors="pt", padding=True)
+        text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+        
+        text_outputs = self.vlm_base.text_model(**text_inputs)
+        text_seq = text_outputs.last_hidden_state
+        text_pooled = text_outputs.pooler_output
+        
+        # Initialize features based on architecture
+        if self.use_cross_attention:
+            # Project text
+            text_seq_proj = self.text_proj(text_seq)
+            
+            # Handle batch size expansion
+            if text_seq_proj.shape[0] == 1 and image_seq_proj.shape[0] > 1:
+                text_seq_proj = text_seq_proj.expand(image_seq_proj.shape[0], -1, -1)
+            
+            # Get negative embeddings
+            negative_text = self._get_negative_embeddings(question_type, device)
+            
+            # Expand negative text if needed
+            if negative_text.shape[0] == 1 and image_seq_proj.shape[0] > 1:
+                negative_text = negative_text.expand(image_seq_proj.shape[0], -1, -1)
+            
+            # Apply cross-attention
+            attended_features = self.cross_attention(
+                image_seq_proj, 
+                text_seq_proj,
+                negative_text
+            )
+            
+            # Use first token as representation
+            features = attended_features[:, 0, :]
+        else:
+            # Simple pooled features without cross-attention
+            features = image_pooled
+        
+        # Calculate cosine similarity
+        similarity = torch.cosine_similarity(features, text_pooled, dim=-1)
+        
+        # Make predictions
+        logits = self.classifier_heads[question_type](features)
+        probs = torch.softmax(logits, dim=-1)
+        preds = torch.argmax(probs, dim=-1)
+        
+        # Always include logits in the return dictionary
+        result = {
+            "logits": logits,
+            "probs": probs,
+            "similarity": similarity.tolist(),
+            "confidence": torch.max(probs, dim=-1)[0].tolist()
+        }
+        
+        # Add formatted text answers if needed
+        if return_dict:
+            if question_type in ['upper_body_color', 'lower_body_color']:
+                result["answer"] = [f"The {question_type.replace('_', ' ')} is {self._get_color_name(p.item())}." for p in preds]
+            elif question_type == 'gender':
+                result["answer"] = [f"The person is {'male' if p.item() == 1 else 'female'}." for p in preds]
+            elif question_type in ['bag', 'hat']:
+                result["answer"] = [f"{'Yes' if p.item() == 1 else 'No'}, the person {'is' if p.item() == 1 else 'is not'} {'carrying a bag' if question_type == 'bag' else 'wearing a hat'}." for p in preds]
+            else:
+                # Generic binary attribute handling
+                if self.num_classes_dict[question_type] == 2:
+                    result["answer"] = [f"{'Yes' if p.item() == 1 else 'No'}, the person {'is' if p.item() == 1 else 'is not'} {question_type.replace('_', ' ')}." for p in preds]
+                # Other attribute types
+                else:
+                    result["answer"] = [f"The person's {question_type.replace('_', ' ')} is class {p.item()}." for p in preds]
+        
+        return result
+    
+    def compute_loss(self, outputs, labels):
+        """
+        Compute combined loss for training
+        Args:
+            outputs: Model outputs with logits and losses
+            labels: Ground truth labels
+        Returns:
+            Total loss value
+        """
+        # Classification loss
+        cls_loss = 0
+        for key in self.questions.keys():
+            if key in labels:
+                attr_labels = labels[key]
+                attr_logits = outputs[key]["logits"]
+                
+                # Use focal loss if enabled, otherwise use cross entropy
+                if self.use_focal_loss:
+                    cls_loss += self.focal_loss(attr_logits, attr_labels)
+                else:
+                    cls_loss += F.cross_entropy(attr_logits, attr_labels)
+        
+        # Add contrastive loss if available
+        contr_loss = 0
+        if "losses" in outputs and "contrastive_loss" in outputs["losses"]:
+            contr_loss = outputs["losses"]["contrastive_loss"]
+        
+        # Total loss with weighting
+        total_loss = cls_loss + self.contrastive_weight * contr_loss
+        
+        return total_loss, {"cls_loss": cls_loss, "contrastive_loss": contr_loss}
+    
+    def prepare_for_training(self):
+        """Prepare the model for training by generating negative prompts"""
+        return self.generate_all_negative_prompts()
+        
+    def print_negative_prompt_examples(self, num_examples=5):
+        """
+        Print examples of generated negative prompts for debugging and verification
+        Args:
+            num_examples: Number of examples to print (default: 5)
+        """
+        if not self.negative_prompts or len(self.negative_prompts) == 0:
+            print("No negative prompts generated yet. Call generate_all_negative_prompts() first.")
+            return
+            
+        print("\n=== NEGATIVE PROMPT EXAMPLES ===")
+        print("Format: Attribute | Positive prompt | Negative prompt")
+        print("-" * 80)
+        
+        # Get a sample of keys (either all or limited by num_examples)
+        keys = list(self.negative_prompts.keys())
+        if num_examples < len(keys):
+            import random
+            keys = random.sample(keys, num_examples)
+            
+        # Print examples
+        for key in keys:
+            positive = self.questions[key]
+            negative = self.negative_prompts[key]
+            print(f"{key:20} | {positive:35} | {negative}")
+        
+        print("-" * 80)
+        
+        # Print word count statistics
+        word_counts = [len(prompt.split()) for prompt in self.negative_prompts.values()]
+        avg_words = sum(word_counts) / len(word_counts) if word_counts else 0
+        max_words = max(word_counts) if word_counts else 0
+        
+        print(f"Average words per negative prompt: {avg_words:.1f}")
+        print(f"Maximum words in any prompt: {max_words}")
+        print("=" * 80)

@@ -1,11 +1,11 @@
 # VLM-PAR
 
 ## Overview
-VLM-PAR is a project designed for [briefly describe the purpose of the project, e.g., "visual language modeling for person attribute recognition"]. This repository contains datasets, models, and utilities to support the development and evaluation of the project.
+VLM-PAR is a project designed for pedestrian attribute recognition. This repository contains datasets, models, and utilities to support the development and evaluation of machine learning models for identifying and classifying attributes of pedestrians in images. The project aims to advance research in computer vision and attribute recognition tasks.
 
 ## Features
 - **Datasets**: Includes support for multiple datasets such as Market-1501, PETA, and others.
-- **Models**: Implements various models for [specific tasks, e.g., "person attribute recognition"].
+- **Models**: Implements various models for pedestrian attribute recognition.
 - **Utilities**: Provides tools for data preprocessing, training, and evaluation.
 
 ## Repository Structure

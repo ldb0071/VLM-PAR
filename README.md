@@ -72,10 +72,3 @@ Contributions are welcome! Please fork the repository and submit a pull request.
 
 ## License
 This project is licensed under the [MIT License](LICENSE).
-
-## Acknowledgments
-- [Mention any acknowledgments, e.g., datasets, libraries, or collaborators]
-
----
-
-For more details, please refer to the documentation or contact the repository owner.
